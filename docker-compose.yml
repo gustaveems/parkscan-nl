@@ -1,0 +1,25 @@
+services:
+  postgres:
+    # Community multi-arch mirror of postgis/postgis — publishes native arm64
+    # builds so Apple Silicon doesn't emulate linux/amd64 under Rosetta.
+    # Same tag scheme and data layout as the official image, so the volume is
+    # portable in either direction.
+    image: imresamu/postgis:16-3.4-alpine
+    container_name: parkscan_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: parkscan
+      POSTGRES_PASSWORD: parkscan
+      POSTGRES_DB: parkscan
+    ports:
+      - "5433:5432"
+    volumes:
+      - parkscan_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parkscan -d parkscan"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  parkscan_pg_data:
