@@ -3,6 +3,8 @@ import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './ScanMap.css';
 
+// OpenStreetMap raster style (no API key required).
+// Switch to a Google Maps JS source later by swapping this style object.
 const MAP_STYLE = {
   version: 8,
   sources: {
@@ -14,90 +16,109 @@ const MAP_STYLE = {
       maxzoom: 19,
     },
   },
-  layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
+  layers: [
+    { id: 'osm', type: 'raster', source: 'osm' },
+  ],
 };
 
-const EMPTY_FC = { type: 'FeatureCollection', features: [] };
 const ACCENT = '#3b82f6';
+const ACCENT_LIGHT = '#60a5fa';
 
-function toGeoRing(center, radiusM, steps = 64) {
-  const [lat, lng] = center;
-  const ring = [];
+function metersPerPixel(lat, zoom) {
+  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
+}
+
+// Haversine distance in meters between two [lng, lat] points.
+function haversine([lng1, lat1], [lng2, lat2]) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Build a GeoJSON polygon approximating a geodesic circle (64 vertices).
+function circleToPolygon([lng, lat], radiusMeters, steps = 64) {
+  const coords = [];
+  const R = 6371000;
+  const latRad = (lat * Math.PI) / 180;
   for (let i = 0; i <= steps; i++) {
-    const a = (i / steps) * 2 * Math.PI;
-    const dLat = (radiusM * Math.sin(a)) / 111320;
-    const dLng = (radiusM * Math.cos(a)) / (111320 * Math.cos((lat * Math.PI) / 180));
-    ring.push([lng + dLng, lat + dLat]);
+    const bearing = (i / steps) * 2 * Math.PI;
+    const dByR = radiusMeters / R;
+    const newLat = Math.asin(
+      Math.sin(latRad) * Math.cos(dByR) +
+        Math.cos(latRad) * Math.sin(dByR) * Math.cos(bearing)
+    );
+    const newLng =
+      ((lng * Math.PI) / 180) +
+      Math.atan2(
+        Math.sin(bearing) * Math.sin(dByR) * Math.cos(latRad),
+        Math.cos(dByR) - Math.sin(latRad) * Math.sin(newLat)
+      );
+    coords.push([(newLng * 180) / Math.PI, (newLat * 180) / Math.PI]);
   }
-  return ring;
+  return { type: 'Polygon', coordinates: [coords] };
 }
 
-function polygonAreaKm2(points) {
-  if (points.length < 3) return 0;
-  const lat0 = points.reduce((s, p) => s + p[0], 0) / points.length;
-  const mPerDegLat = 111320;
-  const mPerDegLng = 111320 * Math.cos((lat0 * Math.PI) / 180);
-  let sum = 0;
-  for (let i = 0; i < points.length; i++) {
-    const [la1, ln1] = points[i];
-    const [la2, ln2] = points[(i + 1) % points.length];
-    const x1 = ln1 * mPerDegLng, y1 = la1 * mPerDegLat;
-    const x2 = ln2 * mPerDegLng, y2 = la2 * mPerDegLat;
-    sum += x1 * y2 - x2 * y1;
+// Shoelace area for a ring of [lng, lat] coords, approximated in km².
+function polygonAreaKm2(ring) {
+  if (!ring || ring.length < 3) return 0;
+  const R = 6371000;
+  let total = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const [lng1, lat1] = ring[i];
+    const [lng2, lat2] = ring[(i + 1) % ring.length];
+    total +=
+      (((lng2 - lng1) * Math.PI) / 180) *
+      (2 + Math.sin((lat1 * Math.PI) / 180) + Math.sin((lat2 * Math.PI) / 180));
   }
-  return Math.abs(sum / 2) / 1e6;
+  const areaM2 = Math.abs((total * R * R) / 2);
+  return areaM2 / 1_000_000;
 }
 
-export default function ScanMap({ mode, center = [52.3676, 4.9041], zoom = 12, onChange }) {
-  const containerRef = useRef(null);
+const EMPTY_FC = { type: 'FeatureCollection', features: [] };
+
+export default function ScanMap({
+  mode,        // 'polygon' | 'radius'
+  center,      // [lat, lng]
+  zoom = 12,
+  onChange,    // (geometry) => void, geometry is GeoJSON Polygon or null
+  candidateSites = [], // optional: [{ id, lat, lng, score? }]
+}) {
+  const mapContainer = useRef(null);
   const mapRef = useRef(null);
-  const radiusRef = useRef(500);
+  const [mapReady, setMapReady] = useState(false);
+
+  // Drawing state (refs to avoid stale closures inside map listeners).
+  const polygonPointsRef = useRef([]);
+  const circleCenterRef = useRef(null);
+  const radiusMRef = useRef(500);
+
+  const [polygonPoints, setPolygonPoints] = useState([]);
+  const [circleCenter, setCircleCenter] = useState(null);
   const [radiusM, setRadiusM] = useState(500);
-  const [vertices, setVertices] = useState([]);
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-  radiusRef.current = radiusM;
+  const [hoverPoint, setHoverPoint] = useState(null);
 
-  const emitCircle = useCallback(
-    (lat, lng, r) => {
-      onChangeRef.current?.({
-        type: 'circle',
-        center: [lng, lat],
-        radiusM: r,
-        areaKm2: (Math.PI * r * r) / 1e6,
-      });
-    },
-    []
-  );
-
-  const emitPolygon = useCallback((pts) => {
-    if (pts.length < 3) {
-      onChangeRef.current?.(null);
-      return;
-    }
-    const ring = [...pts.map(([lat, lng]) => [lng, lat]), [pts[0][1], pts[0][0]]];
-    onChangeRef.current?.({
-      type: 'polygon',
-      geometry: { type: 'Polygon', coordinates: [ring] },
-      vertexCount: pts.length,
-      areaKm2: polygonAreaKm2(pts),
-    });
-  }, []);
-
+  // ── Init map ──────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!containerRef.current) return;
+    if (!mapContainer.current || mapRef.current) return;
+    const [lat, lng] = center;
     const map = new maplibregl.Map({
-      container: containerRef.current,
+      container: mapContainer.current,
       style: MAP_STYLE,
-      center: [center[1], center[0]],
+      center: [lng, lat],
       zoom,
+      attributionControl: { compact: true },
     });
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
-    mapRef.current = map;
-
     map.on('load', () => {
       map.addSource('draw', { type: 'geojson', data: EMPTY_FC });
       map.addSource('draw-vertices', { type: 'geojson', data: EMPTY_FC });
+      map.addSource('candidates', { type: 'geojson', data: EMPTY_FC });
+
       map.addLayer({
         id: 'draw-fill',
         type: 'fill',
@@ -108,116 +129,272 @@ export default function ScanMap({ mode, center = [52.3676, 4.9041], zoom = 12, o
         id: 'draw-line',
         type: 'line',
         source: 'draw',
-        paint: { 'line-color': ACCENT, 'line-width': 2 },
+        paint: { 'line-color': ACCENT_LIGHT, 'line-width': 2 },
       });
       map.addLayer({
-        id: 'draw-vertices',
+        id: 'draw-vertex',
         type: 'circle',
         source: 'draw-vertices',
-        paint: { 'circle-radius': 4, 'circle-color': '#fff', 'circle-stroke-color': ACCENT, 'circle-stroke-width': 2 },
+        paint: {
+          'circle-radius': 5,
+          'circle-color': '#fff',
+          'circle-stroke-color': ACCENT,
+          'circle-stroke-width': 2,
+        },
       });
+      map.addLayer({
+        id: 'candidate-dots',
+        type: 'circle',
+        source: 'candidates',
+        paint: {
+          'circle-radius': 4,
+          'circle-color': [
+            'case',
+            ['>=', ['coalesce', ['get', 'score'], 0], 65], '#10b981',
+            ['>=', ['coalesce', ['get', 'score'], 0], 40], '#f59e0b',
+            '#5a6a85',
+          ],
+          'circle-stroke-color': '#0e1117',
+          'circle-stroke-width': 1,
+        },
+      });
+
+      setMapReady(true);
     });
 
-    map.on('click', (e) => {
-      if (mapModeRef.current === 'polygon') {
-        setVertices((prev) => {
-          const next = [...prev, [e.lngLat.lat, e.lngLat.lng]];
-          emitPolygon(next);
-          return next;
-        });
-      } else if (mapModeRef.current === 'radius') {
-        emitCircle(e.lngLat.lat, e.lngLat.lng, radiusRef.current);
-      }
-    });
-
-    map.on('dblclick', () => {
-      if (mapModeRef.current === 'polygon' && verticesRef.current.length >= 3) {
-        map.doubleClickZoom.disable();
-        setTimeout(() => map.doubleClickZoom.enable(), 0);
-      }
-    });
-
-    return () => map.remove();
+    mapRef.current = map;
+    return () => {
+      map.remove();
+      mapRef.current = null;
+    };
+    // We intentionally initialize only once; view changes are handled below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const mapModeRef = useRef(mode);
-  const verticesRef = useRef(vertices);
-  mapModeRef.current = mode;
-  verticesRef.current = vertices;
-
-  // Redraw layers when state changes
+  // Recenter when the city changes.
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
-    const draw = () => map.getSource('draw');
-    const verts = () => map.getSource('draw-vertices');
+    if (!map || !mapReady) return;
+    const [lat, lng] = center;
+    map.flyTo({ center: [lng, lat], zoom, speed: 1.2 });
+  }, [center[0], center[1], zoom, mapReady]);
 
-    if (mode === 'radius') {
-      const setCircle = () => {
-        const c = map.getCenter();
-        const ring = toGeoRing([c.lat, c.lng], radiusRef.current);
-        draw()?.setData({
-          type: 'FeatureCollection',
-          features: [{ type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } }],
-        });
-        verts()?.setData({
-          type: 'FeatureCollection',
-          features: [{ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [c.lng, c.lat] } }],
-        });
-        emitCircle(c.lat, c.lng, radiusRef.current);
-      };
-      setCircle();
-      map.on('moveend', setCircle);
-      return () => map.off('moveend', setCircle);
-    }
+  // Keep refs in sync with state so map listeners read current values.
+  useEffect(() => { polygonPointsRef.current = polygonPoints; }, [polygonPoints]);
+  useEffect(() => { circleCenterRef.current = circleCenter; }, [circleCenter]);
+  useEffect(() => { radiusMRef.current = radiusM; }, [radiusM]);
+
+  // ── Render drawing to map layers ──────────────────────────────────────────
+  const renderDraw = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const drawSrc = map.getSource('draw');
+    const vertSrc = map.getSource('draw-vertices');
+    if (!drawSrc || !vertSrc) return;
+
+    let fc = EMPTY_FC;
+    let verts = EMPTY_FC;
+
     if (mode === 'polygon') {
-      if (vertices.length >= 3) {
-        const ring = [...vertices.map(([lat, lng]) => [lng, lat]), [vertices[0][1], vertices[0][0]]];
-        draw()?.setData({
+      const pts = polygonPoints.slice();
+      const preview = hoverPoint && pts.length > 0 ? [...pts, hoverPoint] : pts;
+      if (preview.length >= 2) {
+        const closed = preview.length >= 3 ? [...preview, preview[0]] : preview;
+        fc = {
           type: 'FeatureCollection',
-          features: [{ type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } }],
-        });
-      } else if (vertices.length >= 1) {
-        draw()?.setData({
-          type: 'FeatureCollection',
-          features: [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: vertices.map(([lat, lng]) => [lng, lat]) } }],
-        });
-      } else {
-        draw()?.setData(EMPTY_FC);
+          features: [
+            {
+              type: 'Feature',
+              properties: {},
+              geometry: { type: 'LineString', coordinates: closed },
+            },
+            ...(preview.length >= 3
+              ? [
+                  {
+                    type: 'Feature',
+                    properties: {},
+                    geometry: {
+                      type: 'Polygon',
+                      coordinates: [[...preview, preview[0]]],
+                    },
+                  },
+                ]
+              : []),
+          ],
+        };
       }
-      verts()?.setData({
+      verts = {
         type: 'FeatureCollection',
-        features: vertices.map(([lat, lng]) => ({ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [lng, lat] } })),
-      });
-      return undefined;
+        features: pts.map((p) => ({
+          type: 'Feature',
+          properties: {},
+          geometry: { type: 'Point', coordinates: p },
+        })),
+      };
+    } else if (mode === 'radius' && circleCenter) {
+      const poly = circleToPolygon(circleCenter, radiusM);
+      fc = {
+        type: 'FeatureCollection',
+        features: [{ type: 'Feature', properties: {}, geometry: poly }],
+      };
+      verts = {
+        type: 'FeatureCollection',
+        features: [
+          { type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: circleCenter } },
+        ],
+      };
     }
-    draw()?.setData(EMPTY_FC);
-    verts()?.setData(EMPTY_FC);
-    return undefined;
-  }, [mode, radiusM, vertices, emitCircle]);
 
-  // Recenter + reset when city changes
+    drawSrc.setData(fc);
+    vertSrc.setData(verts);
+  }, [mode, polygonPoints, hoverPoint, circleCenter, radiusM, mapReady]);
+
+  useEffect(() => { renderDraw(); }, [renderDraw]);
+
+  // Push candidate sites to the map when provided.
   useEffect(() => {
     const map = mapRef.current;
-    if (map && center) map.flyTo({ center: [center[1], center[0]], zoom, essential: true });
-    setVertices([]);
-    onChangeRef.current?.(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [center[0], center[1]]);
+    if (!map || !mapReady) return;
+    const src = map.getSource('candidates');
+    if (!src) return;
+    src.setData({
+      type: 'FeatureCollection',
+      features: candidateSites.map((s) => ({
+        type: 'Feature',
+        properties: { id: s.id, score: s.score ?? null },
+        geometry: { type: 'Point', coordinates: [s.lng, s.lat] },
+      })),
+    });
+  }, [candidateSites, mapReady]);
 
-  const areaKm2 =
-    mode === 'radius'
-      ? (Math.PI * radiusM * radiusM) / 1e6
-      : polygonAreaKm2(vertices);
+  // ── Mouse / keyboard handlers ─────────────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const onClick = (e) => {
+      const { lng, lat } = e.lngLat;
+      if (mode === 'polygon') {
+        setPolygonPoints((prev) => [...prev, [lng, lat]]);
+      } else if (mode === 'radius') {
+        setCircleCenter([lng, lat]);
+      }
+    };
+    const onDblClick = (e) => {
+      e.preventDefault?.();
+      if (mode === 'polygon' && polygonPointsRef.current.length >= 3) {
+        setHoverPoint(null);
+        emitGeometry();
+      }
+    };
+    const onMouseMove = (e) => {
+      if (mode !== 'polygon') return;
+      if (polygonPointsRef.current.length === 0) return;
+      setHoverPoint([e.lngLat.lng, e.lngLat.lat]);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        setPolygonPoints([]);
+        setHoverPoint(null);
+        setCircleCenter(null);
+        if (onChange) onChange(null);
+      } else if (e.key === 'Enter' && mode === 'polygon' && polygonPointsRef.current.length >= 3) {
+        setHoverPoint(null);
+        emitGeometry();
+      } else if ((e.key === 'Backspace' || e.key === 'z') && mode === 'polygon') {
+        setPolygonPoints((prev) => prev.slice(0, -1));
+      }
+    };
+
+    map.on('click', onClick);
+    map.on('dblclick', onDblClick);
+    map.on('mousemove', onMouseMove);
+    map.doubleClickZoom.disable();
+    window.addEventListener('keydown', onKey);
+    return () => {
+      map.off('click', onClick);
+      map.off('dblclick', onDblClick);
+      map.off('mousemove', onMouseMove);
+      map.doubleClickZoom.enable();
+      window.removeEventListener('keydown', onKey);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, mapReady]);
+
+  // Reset drawing when the mode changes.
+  useEffect(() => {
+    setPolygonPoints([]);
+    setHoverPoint(null);
+    setCircleCenter(null);
+    if (onChange) onChange(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  // Emit geometry whenever a completable shape exists.
+  const emitGeometry = useCallback(() => {
+    if (!onChange) return;
+    if (mode === 'polygon') {
+      const pts = polygonPointsRef.current;
+      if (pts.length < 3) return onChange(null);
+      const ring = [...pts, pts[0]];
+      onChange({
+        type: 'polygon',
+        geometry: { type: 'Polygon', coordinates: [ring] },
+        areaKm2: polygonAreaKm2(pts),
+        vertexCount: pts.length,
+      });
+    } else if (mode === 'radius') {
+      const c = circleCenterRef.current;
+      if (!c) return onChange(null);
+      onChange({
+        type: 'circle',
+        geometry: circleToPolygon(c, radiusMRef.current),
+        center: c,
+        radiusM: radiusMRef.current,
+        areaKm2: (Math.PI * radiusMRef.current * radiusMRef.current) / 1_000_000,
+      });
+    }
+  }, [mode, onChange]);
+
+  // Auto-emit for radius mode whenever center/radius changes.
+  useEffect(() => {
+    if (mode === 'radius') emitGeometry();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [circleCenter, radiusM, mode]);
+
+  // Auto-emit for polygon mode when 3+ points and not actively previewing new vertex.
+  useEffect(() => {
+    if (mode === 'polygon' && polygonPoints.length >= 3) {
+      emitGeometry();
+    } else if (mode === 'polygon' && polygonPoints.length < 3) {
+      onChange?.(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [polygonPoints, mode]);
+
+  const polygonArea = polygonPoints.length >= 3 ? polygonAreaKm2(polygonPoints) : 0;
+  const circleArea = mode === 'radius' && circleCenter
+    ? (Math.PI * radiusM * radiusM) / 1_000_000
+    : 0;
+
+  const helpText =
+    mode === 'polygon'
+      ? polygonPoints.length === 0
+        ? 'Click to place vertices · Enter / double-click to finish · Esc to clear'
+        : `${polygonPoints.length} vertex${polygonPoints.length === 1 ? '' : 'es'} · Double-click / Enter to finish · Backspace undo`
+      : circleCenter
+        ? 'Drag the slider to adjust radius · Click a new center to move'
+        : 'Click anywhere on the map to set center';
 
   return (
     <div className="scan-map-wrap">
-      <div ref={containerRef} className="scan-map" />
+      <div ref={mapContainer} className="scan-map" />
       <div className="scan-map-hud">
-        {mode === 'radius' && (
+        <div className="scan-map-help">{helpText}</div>
+        {mode === 'radius' && circleCenter && (
           <div className="scan-map-radius">
-            <label className="form-label mono">RADIUS</label>
+            <label className="mono">RADIUS</label>
             <input
               type="range"
               min="100"
@@ -229,26 +406,14 @@ export default function ScanMap({ mode, center = [52.3676, 4.9041], zoom = 12, o
             <span className="mono">{radiusM} m</span>
           </div>
         )}
-        {mode === 'polygon' && (
-          <div className="scan-map-radius">
-            <button className="btn btn-sm btn-ghost" onClick={() => setVertices((v) => v.slice(0, -1))}>
-              Undo vertex
-            </button>
-            <button className="btn btn-sm btn-ghost" onClick={() => setVertices([])}>
-              Clear
-            </button>
+        {(polygonArea > 0 || circleArea > 0) && (
+          <div className="scan-map-stats">
+            <span className="mono">AREA</span>
+            <span className="mono stat-value">
+              {(polygonArea || circleArea).toFixed(2)} km²
+            </span>
           </div>
         )}
-        <div className="scan-map-stats mono">
-          {mode === 'radius' && <span>click map to move centre</span>}
-          {mode === 'polygon' && <span>{vertices.length} vertices — click to add</span>}
-          {vertices.length > 0 || mode === 'radius' ? <span>≈ {areaKm2.toFixed(2)} km²</span> : null}
-        </div>
-      </div>
-      <div className="scan-map-help mono">
-        {mode === 'radius'
-          ? 'Drag the map + slider to frame the block, then run the scan.'
-          : 'Click to drop polygon vertices around the target block.'}
       </div>
     </div>
   );

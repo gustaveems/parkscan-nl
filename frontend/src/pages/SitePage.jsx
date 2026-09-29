@@ -1,420 +1,259 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import maplibregl from 'maplibre-gl';
-import 'maplibre-gl/dist/maplibre-gl.css';
-import '../components/ScanMap.css';
+import { useEffect, useMemo, useState } from 'react';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
+import { api } from '../lib/api';
+import ScoreRing from '../components/ScoreRing';
+import { mapStaticUrl, streetViewUrls360, streetViewAvailable } from '../lib/images';
+import { scoreLabel } from '../lib/utils';
+import './SitePage.css';
 
-// OpenStreetMap raster style (no API key required).
-// Switch to a Google Maps JS source later by swapping this style object.
-const MAP_STYLE = {
-  version: 8,
-  sources: {
-    osm: {
-      type: 'raster',
-      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-      tileSize: 256,
-      attribution: '© OpenStreetMap contributors',
-      maxzoom: 19,
-    },
-  },
-  layers: [
-    { id: 'osm', type: 'raster', source: 'osm' },
-  ],
-};
+// Reconstructed (Sept 2026) to the recovered SitePage.css class contract:
+// header + pipeline status, scores banner, BAG/context/map sections,
+// ownership + conversion spotlight, street view strip.
 
-const ACCENT = '#3b82f6';
-const ACCENT_LIGHT = '#60a5fa';
+const STEPS = ['Identified', 'Enriched', 'Scored', 'Owner', 'Report'];
 
-function metersPerPixel(lat, zoom) {
-  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
+function statusIndex(status) {
+  if (!status) return 0;
+  if (status === 'report_ready') return 4;
+  if (status === 'owner_found' || status === 'contacted' || status === 'negotiating') return 3;
+  if (status === 'scored') return 2;
+  if (status === 'enriched') return 1;
+  return 0;
 }
 
-// Haversine distance in meters between two [lng, lat] points.
-function haversine([lng1, lat1], [lng2, lat2]) {
-  const R = 6371000;
-  const toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
+export default function SitePage() {
+  const { id } = useParams();
+  const nav = useNavigate();
+  const [params] = useSearchParams();
+  const [data, setData] = useState(null);
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [tab, setTab] = useState('context');
 
-// Build a GeoJSON polygon approximating a geodesic circle (64 vertices).
-function circleToPolygon([lng, lat], radiusMeters, steps = 64) {
-  const coords = [];
-  const R = 6371000;
-  const latRad = (lat * Math.PI) / 180;
-  for (let i = 0; i <= steps; i++) {
-    const bearing = (i / steps) * 2 * Math.PI;
-    const dByR = radiusMeters / R;
-    const newLat = Math.asin(
-      Math.sin(latRad) * Math.cos(dByR) +
-        Math.cos(latRad) * Math.sin(dByR) * Math.cos(bearing)
-    );
-    const newLng =
-      ((lng * Math.PI) / 180) +
-      Math.atan2(
-        Math.sin(bearing) * Math.sin(dByR) * Math.cos(latRad),
-        Math.cos(dByR) - Math.sin(latRad) * Math.sin(newLat)
-      );
-    coords.push([(newLng * 180) / Math.PI, (newLat * 180) / Math.PI]);
+  const load = () => api.getSite(id).then(setData).catch((e) => setError(e.message));
+  useEffect(() => { load(); }, [id]);
+
+  useEffect(() => {
+    // Deep-link ?run=1 auto-runs the missing stages (queue "Report Ready" path).
+    if (!data || params.get('run') !== '1' || data.report) return;
+    (async () => {
+      try {
+        setBusy('pipeline');
+        if (!data.score) await api.scoreSite(id);
+        if (!data.owner) await api.lookupOwnership(id);
+        await load();
+      } catch (e) { setError(e.message); } finally { setBusy(''); }
+    })();
+  }, [data]); // eslint-disable-line
+
+  async function run(action) {
+    setBusy(action); setError('');
+    try {
+      if (action === 'enrich') await api.enrichSite(id);
+      if (action === 'score') await api.scoreSite(id);
+      if (action === 'ownership') await api.lookupOwnership(id);
+      await load();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
   }
-  return { type: 'Polygon', coordinates: [coords] };
-}
 
-// Shoelace area for a ring of [lng, lat] coords, approximated in km².
-function polygonAreaKm2(ring) {
-  if (!ring || ring.length < 3) return 0;
-  const R = 6371000;
-  let total = 0;
-  for (let i = 0; i < ring.length; i++) {
-    const [lng1, lat1] = ring[i];
-    const [lng2, lat2] = ring[(i + 1) % ring.length];
-    total +=
-      (((lng2 - lng1) * Math.PI) / 180) *
-      (2 + Math.sin((lat1 * Math.PI) / 180) + Math.sin((lat2 * Math.PI) / 180));
-  }
-  const areaM2 = Math.abs((total * R * R) / 2);
-  return areaM2 / 1_000_000;
-}
+  const site = data?.site;
+  const score = data?.score;
+  const owner = data?.owner;
+  const conv = data?.conversion;
+  const ctx = site?.context;
+  const step = statusIndex(site?.status);
 
-const EMPTY_FC = { type: 'FeatureCollection', features: [] };
-
-export default function ScanMap({
-  mode,        // 'polygon' | 'radius'
-  center,      // [lat, lng]
-  zoom = 12,
-  onChange,    // (geometry) => void, geometry is GeoJSON Polygon or null
-  candidateSites = [], // optional: [{ id, lat, lng, score? }]
-}) {
-  const mapContainer = useRef(null);
-  const mapRef = useRef(null);
-  const [mapReady, setMapReady] = useState(false);
-
-  // Drawing state (refs to avoid stale closures inside map listeners).
-  const polygonPointsRef = useRef([]);
-  const circleCenterRef = useRef(null);
-  const radiusMRef = useRef(500);
-
-  const [polygonPoints, setPolygonPoints] = useState([]);
-  const [circleCenter, setCircleCenter] = useState(null);
-  const [radiusM, setRadiusM] = useState(500);
-  const [hoverPoint, setHoverPoint] = useState(null);
-
-  // ── Init map ──────────────────────────────────────────────────────────────
+  const sv = useMemo(
+    () => (site ? streetViewUrls360(site.lat, site.lng) : []),
+    [site],
+  );
+  const [svOk, setSvOk] = useState(null);
   useEffect(() => {
-    if (!mapContainer.current || mapRef.current) return;
-    const [lat, lng] = center;
-    const map = new maplibregl.Map({
-      container: mapContainer.current,
-      style: MAP_STYLE,
-      center: [lng, lat],
-      zoom,
-      attributionControl: { compact: true },
-    });
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
-    map.on('load', () => {
-      map.addSource('draw', { type: 'geojson', data: EMPTY_FC });
-      map.addSource('draw-vertices', { type: 'geojson', data: EMPTY_FC });
-      map.addSource('candidates', { type: 'geojson', data: EMPTY_FC });
+    if (!site) return;
+    let alive = true;
+    setSvOk(null);
+    streetViewAvailable(site.lat, site.lng).then((v) => alive && setSvOk(v));
+    return () => { alive = false; };
+  }, [site]);
 
-      map.addLayer({
-        id: 'draw-fill',
-        type: 'fill',
-        source: 'draw',
-        paint: { 'fill-color': ACCENT, 'fill-opacity': 0.15 },
-      });
-      map.addLayer({
-        id: 'draw-line',
-        type: 'line',
-        source: 'draw',
-        paint: { 'line-color': ACCENT_LIGHT, 'line-width': 2 },
-      });
-      map.addLayer({
-        id: 'draw-vertex',
-        type: 'circle',
-        source: 'draw-vertices',
-        paint: {
-          'circle-radius': 5,
-          'circle-color': '#fff',
-          'circle-stroke-color': ACCENT,
-          'circle-stroke-width': 2,
-        },
-      });
-      map.addLayer({
-        id: 'candidate-dots',
-        type: 'circle',
-        source: 'candidates',
-        paint: {
-          'circle-radius': 4,
-          'circle-color': [
-            'case',
-            ['>=', ['coalesce', ['get', 'score'], 0], 65], '#10b981',
-            ['>=', ['coalesce', ['get', 'score'], 0], 40], '#f59e0b',
-            '#5a6a85',
-          ],
-          'circle-stroke-color': '#0e1117',
-          'circle-stroke-width': 1,
-        },
-      });
-
-      setMapReady(true);
-    });
-
-    mapRef.current = map;
-    return () => {
-      map.remove();
-      mapRef.current = null;
-    };
-    // We intentionally initialize only once; view changes are handled below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Recenter when the city changes.
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady) return;
-    const [lat, lng] = center;
-    map.flyTo({ center: [lng, lat], zoom, speed: 1.2 });
-  }, [center[0], center[1], zoom, mapReady]);
-
-  // Keep refs in sync with state so map listeners read current values.
-  useEffect(() => { polygonPointsRef.current = polygonPoints; }, [polygonPoints]);
-  useEffect(() => { circleCenterRef.current = circleCenter; }, [circleCenter]);
-  useEffect(() => { radiusMRef.current = radiusM; }, [radiusM]);
-
-  // ── Render drawing to map layers ──────────────────────────────────────────
-  const renderDraw = useCallback(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady) return;
-
-    const drawSrc = map.getSource('draw');
-    const vertSrc = map.getSource('draw-vertices');
-    if (!drawSrc || !vertSrc) return;
-
-    let fc = EMPTY_FC;
-    let verts = EMPTY_FC;
-
-    if (mode === 'polygon') {
-      const pts = polygonPoints.slice();
-      const preview = hoverPoint && pts.length > 0 ? [...pts, hoverPoint] : pts;
-      if (preview.length >= 2) {
-        const closed = preview.length >= 3 ? [...preview, preview[0]] : preview;
-        fc = {
-          type: 'FeatureCollection',
-          features: [
-            {
-              type: 'Feature',
-              properties: {},
-              geometry: { type: 'LineString', coordinates: closed },
-            },
-            ...(preview.length >= 3
-              ? [
-                  {
-                    type: 'Feature',
-                    properties: {},
-                    geometry: {
-                      type: 'Polygon',
-                      coordinates: [[...preview, preview[0]]],
-                    },
-                  },
-                ]
-              : []),
-          ],
-        };
-      }
-      verts = {
-        type: 'FeatureCollection',
-        features: pts.map((p) => ({
-          type: 'Feature',
-          properties: {},
-          geometry: { type: 'Point', coordinates: p },
-        })),
-      };
-    } else if (mode === 'radius' && circleCenter) {
-      const poly = circleToPolygon(circleCenter, radiusM);
-      fc = {
-        type: 'FeatureCollection',
-        features: [{ type: 'Feature', properties: {}, geometry: poly }],
-      };
-      verts = {
-        type: 'FeatureCollection',
-        features: [
-          { type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: circleCenter } },
-        ],
-      };
-    }
-
-    drawSrc.setData(fc);
-    vertSrc.setData(verts);
-  }, [mode, polygonPoints, hoverPoint, circleCenter, radiusM, mapReady]);
-
-  useEffect(() => { renderDraw(); }, [renderDraw]);
-
-  // Push candidate sites to the map when provided.
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady) return;
-    const src = map.getSource('candidates');
-    if (!src) return;
-    src.setData({
-      type: 'FeatureCollection',
-      features: candidateSites.map((s) => ({
-        type: 'Feature',
-        properties: { id: s.id, score: s.score ?? null },
-        geometry: { type: 'Point', coordinates: [s.lng, s.lat] },
-      })),
-    });
-  }, [candidateSites, mapReady]);
-
-  // ── Mouse / keyboard handlers ─────────────────────────────────────────────
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady) return;
-
-    const onClick = (e) => {
-      const { lng, lat } = e.lngLat;
-      if (mode === 'polygon') {
-        setPolygonPoints((prev) => [...prev, [lng, lat]]);
-      } else if (mode === 'radius') {
-        setCircleCenter([lng, lat]);
-      }
-    };
-    const onDblClick = (e) => {
-      e.preventDefault?.();
-      if (mode === 'polygon' && polygonPointsRef.current.length >= 3) {
-        setHoverPoint(null);
-        emitGeometry();
-      }
-    };
-    const onMouseMove = (e) => {
-      if (mode !== 'polygon') return;
-      if (polygonPointsRef.current.length === 0) return;
-      setHoverPoint([e.lngLat.lng, e.lngLat.lat]);
-    };
-    const onKey = (e) => {
-      if (e.key === 'Escape') {
-        setPolygonPoints([]);
-        setHoverPoint(null);
-        setCircleCenter(null);
-        if (onChange) onChange(null);
-      } else if (e.key === 'Enter' && mode === 'polygon' && polygonPointsRef.current.length >= 3) {
-        setHoverPoint(null);
-        emitGeometry();
-      } else if ((e.key === 'Backspace' || e.key === 'z') && mode === 'polygon') {
-        setPolygonPoints((prev) => prev.slice(0, -1));
-      }
-    };
-
-    map.on('click', onClick);
-    map.on('dblclick', onDblClick);
-    map.on('mousemove', onMouseMove);
-    map.doubleClickZoom.disable();
-    window.addEventListener('keydown', onKey);
-    return () => {
-      map.off('click', onClick);
-      map.off('dblclick', onDblClick);
-      map.off('mousemove', onMouseMove);
-      map.doubleClickZoom.enable();
-      window.removeEventListener('keydown', onKey);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, mapReady]);
-
-  // Reset drawing when the mode changes.
-  useEffect(() => {
-    setPolygonPoints([]);
-    setHoverPoint(null);
-    setCircleCenter(null);
-    if (onChange) onChange(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
-
-  // Emit geometry whenever a completable shape exists.
-  const emitGeometry = useCallback(() => {
-    if (!onChange) return;
-    if (mode === 'polygon') {
-      const pts = polygonPointsRef.current;
-      if (pts.length < 3) return onChange(null);
-      const ring = [...pts, pts[0]];
-      onChange({
-        type: 'polygon',
-        geometry: { type: 'Polygon', coordinates: [ring] },
-        areaKm2: polygonAreaKm2(pts),
-        vertexCount: pts.length,
-      });
-    } else if (mode === 'radius') {
-      const c = circleCenterRef.current;
-      if (!c) return onChange(null);
-      onChange({
-        type: 'circle',
-        geometry: circleToPolygon(c, radiusMRef.current),
-        center: c,
-        radiusM: radiusMRef.current,
-        areaKm2: (Math.PI * radiusMRef.current * radiusMRef.current) / 1_000_000,
-      });
-    }
-  }, [mode, onChange]);
-
-  // Auto-emit for radius mode whenever center/radius changes.
-  useEffect(() => {
-    if (mode === 'radius') emitGeometry();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [circleCenter, radiusM, mode]);
-
-  // Auto-emit for polygon mode when 3+ points and not actively previewing new vertex.
-  useEffect(() => {
-    if (mode === 'polygon' && polygonPoints.length >= 3) {
-      emitGeometry();
-    } else if (mode === 'polygon' && polygonPoints.length < 3) {
-      onChange?.(null);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [polygonPoints, mode]);
-
-  const polygonArea = polygonPoints.length >= 3 ? polygonAreaKm2(polygonPoints) : 0;
-  const circleArea = mode === 'radius' && circleCenter
-    ? (Math.PI * radiusM * radiusM) / 1_000_000
-    : 0;
-
-  const helpText =
-    mode === 'polygon'
-      ? polygonPoints.length === 0
-        ? 'Click to place vertices · Enter / double-click to finish · Esc to clear'
-        : `${polygonPoints.length} vertex${polygonPoints.length === 1 ? '' : 'es'} · Double-click / Enter to finish · Backspace undo`
-      : circleCenter
-        ? 'Drag the slider to adjust radius · Click a new center to move'
-        : 'Click anywhere on the map to set center';
+  if (error && !site) return <div className="site-page"><p className="error">{error}</p></div>;
+  if (!site) return <div className="site-page"><p>Loading dossier…</p></div>;
 
   return (
-    <div className="scan-map-wrap">
-      <div ref={mapContainer} className="scan-map" />
-      <div className="scan-map-hud">
-        <div className="scan-map-help">{helpText}</div>
-        {mode === 'radius' && circleCenter && (
-          <div className="scan-map-radius">
-            <label className="mono">RADIUS</label>
-            <input
-              type="range"
-              min="100"
-              max="3000"
-              step="50"
-              value={radiusM}
-              onChange={(e) => setRadiusM(Number(e.target.value))}
-            />
-            <span className="mono">{radiusM} m</span>
+    <div className="site-page">
+      <header className="site-header">
+        <div className="site-header-main">
+          <div className="site-meta-row mono">
+            SCAN {site.scanId} · {site.city.toUpperCase()} / {site.district?.toUpperCase() ?? 'AREA'}
+            <span className="dot-sep">·</span>
+            <span className="bag-tag">{site.source}</span>
           </div>
-        )}
-        {(polygonArea > 0 || circleArea > 0) && (
-          <div className="scan-map-stats">
-            <span className="mono">AREA</span>
-            <span className="mono stat-value">
-              {(polygonArea || circleArea).toFixed(2)} km²
-            </span>
+          <div className="site-title-row">
+            <h1>{site.address}</h1>
+            <span className="bag-tag">{site.bagStatus || 'BAG'} </span>
           </div>
-        )}
+          <div className="pipeline-status">
+            {STEPS.map((label, i) => (
+              <span key={label} className={`ps-step ${i < step ? 'done' : i === step ? 'current' : ''}`}>
+                <span className="ps-dot" /><span className="ps-label">{label}</span>
+                {i < STEPS.length - 1 && <span className="ps-line" />}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div className="site-header-actions">
+          <button className="btn btn-sm" onClick={() => run('enrich')} disabled={!!busy}>
+            {busy === 'enrich' ? '…' : 'Re-enrich'}
+          </button>
+          <button className="btn btn-sm" onClick={() => run('score')} disabled={!!busy}>Re-score</button>
+          <button className="btn btn-sm" onClick={() => run('ownership')} disabled={!!busy}>Owner lookup</button>
+          <button className="btn btn-sm btn-primary" disabled={!score || !owner}
+                  onClick={() => nav(`/sites/${id}/report`)}>Open Report →</button>
+        </div>
+      </header>
+
+      <section className="scores-banner">
+        <div className="scores-rings">
+          <ScoreRing score={score?.vacancyScore ?? 0} size={104} label="Vacancy" sublabel={score ? scoreLabel(score.vacancyScore) : 'unscored'} />
+          <ScoreRing score={score?.parkingScore ?? 0} size={104} label="Parking" sublabel={score ? scoreLabel(score.parkingScore) : ''} />
+        </div>
+        <div className="scores-divider" />
+        <div className="signals-list">
+          {(score?.reasons ?? []).slice(0, 6).map((r, i) => (
+            <div key={i} className={`signal-row ${r.type}`}>
+              <span className="ci-icon">{r.type === 'positive' ? '▲' : r.type === 'negative' ? '▼' : '◆'}</span>
+              <span className="ci-label">{r.label}</span>
+              <span className="signal-weight mono">{r.weight > 0 ? '+' : ''}{r.weight}</span>
+            </div>
+          ))}
+          {!score && <p className="eo-sub">Run scoring to see the weighted reasons.</p>}
+        </div>
+      </section>
+
+      <div className="tabs-bar">
+        {['context', 'bag', 'streetview'].map((t) => (
+          <button key={t} className={`tab-btn ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
+            {t === 'bag' ? 'BAG / Kadaster' : t === 'streetview' ? 'Street View 360°' : 'Surroundings'}
+          </button>
+        ))}
       </div>
+
+      <div className="two-col">
+        <div className="section-card tab-content">
+          {tab === 'context' && (
+            <>
+              <h3 className="section-card-title">POI context</h3>
+              <div className="context-items">
+                <div className="context-item"><span className="ci-value">{ctx?.totalCount ?? '—'}</span><span className="ci-label">nearby POIs</span></div>
+                <div className="context-item"><span className="ci-value">{ctx?.transitProximity ? '✓' : '—'}</span><span className="ci-label">transit ≤ 250 m</span></div>
+                <div className="context-item"><span className="ci-value">{ctx?.retailProximity ? '✓' : '—'}</span><span className="ci-label">retail core</span></div>
+                <div className="context-item"><span className="ci-value">{ctx?.hospitalProximity ? '✓' : '—'}</span><span className="ci-label">hospital zone</span></div>
+              </div>
+              <div className="map-placeholder">
+                <img className="map-real" src={mapStaticUrl(site.lat, site.lng, { size: '600x380' })} alt="Static map" />
+                <div className="map-grid">
+                  <div className="map-pin-center"><span className="map-pin-label">{site.bagId ?? 'BAG object'}</span></div>
+                </div>
+              </div>
+            </>
+          )}
+          {tab === 'bag' && (
+            <>
+              <h3 className="section-card-title">BAG registry</h3>
+              <div className="bag-grid">
+                {[
+                  ['Verblijfsobject', site.bagId],
+                  ['Perceel', site.parcelRef],
+                  ['Gebruiksfunctie', site.usePurpose],
+                  ['Vloeroppervlak', site.areaSqm ? `${site.areaSqm} m²` : null],
+                  ['Bouwjaar', site.buildYear],
+                  ['Status', site.bagStatus],
+                ].map(([k, v]) => (
+                  <div key={k} className="bag-field">
+                    <span className="bag-field-label">{k}</span>
+                    <span className="bag-field-value">{v ?? '—'}</span>
+                  </div>
+                ))}
+              </div>
+              <p className="img-attrib">Owners via Kadaster Eigendomsinformatie (illustrative without broker contract).</p>
+            </>
+          )}
+          {tab === 'streetview' && (
+            <>
+              <h3 className="section-card-title">Frontage survey</h3>
+              <div className="streetview-360">
+                {sv.map((s) => (
+                  <div key={s.label} className="sv-tile">
+                    {svOk === false
+                      ? <div className="streetview-mock" title={s.label}>
+                          <div className="sv-facade"><div className="sv-windows"><i className="sv-window" /><i className="sv-window" /></div><div className="sv-door" /><div className="sv-street" /></div>
+                        </div>
+                      : <img className="streetview-real" src={s.url} alt={`${s.label} view`} loading="lazy" />}
+                    <span className="sv-label mono">{s.short}</span>
+                    {site.frontage?.headings?.find((h) => h.short === s.short)?.inactive && <span className="bag-tag">inactive</span>}
+                  </div>
+                ))}
+              </div>
+              {site.frontage?.signals?.length > 0 && (
+                <div className="context-items">
+                  {site.frontage.signals.slice(0, 5).map((sig, i) => (
+                    <div key={i} className="context-item"><span className="ci-icon">✦</span><span className="ci-label">{sig}</span></div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        <div className="section-card">
+          <h3 className="section-card-title">Ownership &amp; opportunity</h3>
+          {owner ? (
+            <div className="kv-grid">
+              <div className="kv-row"><span className="kv-label">Owner</span><span className="kv-value owner-highlight">{owner.ownerName}</span></div>
+              <div className="kv-row"><span className="kv-label">Type</span><span className="kv-value">{owner.ownershipType} · {owner.ownershipConfidence}</span></div>
+              <div className="kv-row"><span className="kv-label">Source</span><span className="kv-value">{owner.source}</span></div>
+            </div>
+          ) : (
+            <div className="empty-ownership">
+              <span className="eo-icon">?</span>
+              <div className="eo-title">Owner not resolved yet</div>
+              <div className="eo-sub">Run “Owner lookup” — Kadaster Eigendomsinformatie.</div>
+            </div>
+          )}
+
+          {conv ? (
+            <div className="overview-conversion-body">
+              <div className="conversion-hero overview-conv-primary">
+                <div className="overview-conv-icon-wrap"><span className="overview-conv-icon">€</span></div>
+                <div>
+                  <div className="overview-conv-h1">≈ {conv.spacesEst} bays</div>
+                  <div className="overview-conv-title">{conv.netRevenueMonthly.toLocaleString()} € net / month</div>
+                  <div className="overview-conv-sub">Payback {conv.paybackYears} y · ROI {conv.annualRoiPct}%</div>
+                </div>
+              </div>
+              <div className="conv-divider" />
+              <div className="overview-conv-chart revenue-bar-chart">
+                {[['Low', conv.revenueLow], ['Base', conv.revenueBase], ['High', conv.revenueHigh]].map(([k, v], i, arr) => (
+                  <div key={k} className="rev-bar-row">
+                    <span className="rev-bar-label">{k}</span>
+                    <div className="rev-bar-track"><div className="rev-bar-fill" style={{ width: `${(v / arr[2][1]) * 100}%` }} /></div>
+                    <span className="rev-bar-value mono">€{v.toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="overview-conv-footnote">
+                <span className="conv-metric"><span className="conv-num">€{conv.setupCostBase.toLocaleString()}</span> setup</span>
+                <span className="conv-metric"><span className="conv-num">{conv.monthlyRatePerSpace} €</span> /bay/mo</span>
+                <span className="conv-metric"><span className="conv-num">{conv.sqmPerSpace} m²</span> /bay</span>
+              </div>
+            </div>
+          ) : (
+            <div className="overview-conversion-empty">Conversion model appears after scoring + ownership.</div>
+          )}
+        </div>
+      </div>
+      {error && <p className="error">{error}</p>}
     </div>
   );
 }
