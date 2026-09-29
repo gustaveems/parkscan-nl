@@ -1,6 +1,25 @@
 // Helpers for building backend image-proxy URLs. The proxy keeps the Google
 // API key server-side.
 
+
+// ── GitHub Pages demo: <img> tags can't go through the fetch shim, so map /
+// Street View URLs become labelled inline SVG placeholders (same idea as the
+// backend's zero-key mock SVGs).
+const DEMO_MODE =
+  typeof location !== "undefined" &&
+  (location.hostname.endsWith("github.io") ||
+    new URLSearchParams(location.search).get("demo") === "1");
+
+function demoSvg(title, sub) {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400">` +
+    `<rect width="100%" height="100%" fill="#121c30"/>` +
+    `<rect x="8" y="8" width="624" height="384" fill="none" stroke="#3b82f6" stroke-dasharray="6 6"/>` +
+    `<text x="50%" y="47%" fill="#60a5fa" font-family="Arial" font-size="22" text-anchor="middle">${title}</text>` +
+    `<text x="50%" y="57%" fill="#64748b" font-family="monospace" font-size="13" text-anchor="middle">${sub}</text></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
 const DEFAULTS = {
   staticSize: "640x400",
   staticZoom: 17,
@@ -11,6 +30,7 @@ const DEFAULTS = {
 };
 
 export function mapStaticUrl(lat, lng, opts = {}) {
+  if (DEMO_MODE) return demoSvg("Static Map · live in full app", `${lat.toFixed(5)}, ${lng.toFixed(5)}`);
   const params = new URLSearchParams({
     lat: String(lat),
     lng: String(lng),
@@ -22,6 +42,7 @@ export function mapStaticUrl(lat, lng, opts = {}) {
 }
 
 export function streetViewUrl(lat, lng, opts = {}) {
+  if (DEMO_MODE) return demoSvg("Street View · live in full app", `heading ${opts.heading ?? 0}° · ${lat.toFixed(4)},${lng.toFixed(4)}`);
   const params = new URLSearchParams({
     lat: String(lat),
     lng: String(lng),
