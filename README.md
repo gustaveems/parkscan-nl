@@ -311,7 +311,7 @@ Built for the SULC Hackathon by [@gamsoulasieu2024-gif](https://github.com/gamso
 
 This repository is the original hackathon codebase (built in Cursor, Apr 2026),
 recovered from local editor snapshots after the account that hosted it was
-banned. Core files (Express backend, PDOK/BAG + scoring + outreach services,
+lost. Core files (Express backend, PDOK/BAG + scoring + outreach services,
 React + MapLibre frontend, test suites) are the final revisions as they existed
 in the original workspace. A handful of files that were never re-saved after
 the first snapshot (`index.html`, `main.jsx`, `App.jsx`, `index.css`,
